@@ -1,10 +1,11 @@
 ﻿#include <iostream>
 #include <list>
 #include <queue>
+#include <cstdint>
 
 #define MAX_QUEUES 64
 #define MEMORY_SIZE 2048
-#define CHUNK_SIZE 8
+#define CHUNK_SIZE 64
 
 
 struct Q {
@@ -15,12 +16,13 @@ struct Q {
 	bool destroyed = false;
 };
 
-const uint16_t DATA_SIZE = CHUNK_SIZE - sizeof(std::uint16_t);
+const uint16_t DATA_SIZE = CHUNK_SIZE - sizeof(std::uint16_t) - sizeof(std::uint16_t);
 
 struct DataChunk {
 	unsigned char data[DATA_SIZE];
 	std::uint16_t next;
-} data_chunk;
+	std::uint16_t size;  // Number of bytes enqueued to this chunk
+};
 
 static std::uint16_t free_list_head = 0;
 
@@ -72,6 +74,10 @@ void on_illegal_operation() {
 // Creates a FIFO byte queue, returning a handle to it.
 Q* create_queue() {
 
+	if (queue_counter >= MAX_QUEUES) {
+		on_out_of_memory();
+	}
+
 	std::uint16_t metadata_id = queue_counter;
 
 	uint16_t q_byte_index = metadata_id * (sizeof(Q) / sizeof(unsigned char));
@@ -88,10 +94,12 @@ Q* create_queue() {
 	free_list_head = current_chunk->next;
 
 	current_chunk->next = 0;
+	current_chunk->size = 0;
 
 	q_ptr->head = chunk_index;
 	q_ptr->tail = chunk_index;
 	q_ptr->index_position = 0;
+	q_ptr->read_offset = 0;
 
 	// std::cout << "Queue created at: " << q_ptr << ". Head at: " << q_ptr->head << ". Tail at: " << q_ptr->tail << ". Size: " << q_ptr->size << std::endl;
 
@@ -105,21 +113,18 @@ void destroy_queue(Q* q) {
 		on_illegal_operation();
 	}
 
-	std::uint16_t q_first_index = q->head;
-	std::uint16_t q_size = q->tail;
+	std::uint16_t current_index = q->head;
 
-	if (q->index_position == 0 || q->head == 0) {
-		q->head = 0;
-		q->tail = 0;
-		q->index_position = 0;
-		// std::cout << "Queue " << q_ptr << " successfully destroyed" << std::endl;
-		return;
+	// Iteruj přes všechny chunky a vrať je do free list
+	if (current_index != 0) {
+		while (current_index != 0) {
+			DataChunk* current_chunk = reinterpret_cast<DataChunk*>(&data[current_index]);
+			std::uint16_t next_index = current_chunk->next;
+			current_chunk->next = free_list_head;
+			free_list_head = current_index;
+			current_index = next_index;
+		}
 	}
-
-	DataChunk* tail_chunk = reinterpret_cast<DataChunk*>(&data[q_size]);
-
-	tail_chunk->next = free_list_head;
-	free_list_head = q_first_index;
 
 	q->head = 0;
 	q->tail = 0;
@@ -138,10 +143,11 @@ void enqueue_byte(Q* q, unsigned char b) {
 	}
 
 	DataChunk* current_chunk = reinterpret_cast<DataChunk*>(&data[q->tail]);
-	std::uint16_t true_size = q->index_position - q->read_offset;
+	std::int32_t true_size_signed = (std::int32_t)q->index_position - (std::int32_t)q->read_offset;
+	std::uint16_t true_size = (true_size_signed >= 0) ? (std::uint16_t)true_size_signed : 0;
 	std::uint16_t byte_offset = true_size % DATA_SIZE;
 
-	if (byte_offset == 0 && true_size > 0) {
+	if ((byte_offset == 0 && true_size > 0) || (true_size_signed < 0)) {
 		std::uint16_t new_chunk_index = free_list_head;
 
 		if (new_chunk_index == 0) {
@@ -152,14 +158,17 @@ void enqueue_byte(Q* q, unsigned char b) {
 
 		free_list_head = new_chunk->next;
 		new_chunk->next = 0;
+		new_chunk->size = 0;
 
 		current_chunk->next = new_chunk_index;
 		q->tail = new_chunk_index;
 
 		current_chunk = new_chunk;
+		byte_offset = 0;
 	}
 
 	current_chunk->data[byte_offset] = b;
+	current_chunk->size = byte_offset + 1;
 	q->index_position++;
 
 	// std::cout << "Enqueued '" << (int)b << "'. Tail at " << q_ptr->tail << ". Local offset " << byte_offset << ". New size: " << q_ptr->size << std::endl;
@@ -177,7 +186,8 @@ unsigned char dequeue_byte(Q* q) {
 	q->read_offset++;
 	q->index_position--;
 
-	if (q->read_offset >= DATA_SIZE) {
+	// Check if we've read all bytes from this chunk
+	if (q->read_offset >= head_chunk->size) {
 		if (q->index_position == 0) {
 			q->head = 0;
 			q->tail = 0;
@@ -219,8 +229,11 @@ int main()
 	printf("%d\n", dequeue_byte(q1));
 	destroy_queue(q1);
 
-	std::uint16_t DATA_SEGMENT = TOTAL_CHUNKS * sizeof(data_chunk.data);
-	std::uint16_t POINTER_SEGMENT = TOTAL_CHUNKS * sizeof(data_chunk.next);
-	std::cout << "\nMemory:\n";
-	std::cout << "[Queues/pointers: " << METADATA_POOL_SIZE + POINTER_SEGMENT << " bytes]\n[Free: " << DATA_SEGMENT << " bytes]\n";
+	std::uint16_t DATA_SEGMENT = TOTAL_CHUNKS * DATA_SIZE;
+	std::uint16_t POINTER_SEGMENT = TOTAL_CHUNKS * sizeof(std::uint16_t);
+	std::cout << "\nMemory Usage:\n";
+	std::cout << "[Metadata: " << METADATA_POOL_SIZE << " bytes]\n";
+	std::cout << "[Data capacity: " << DATA_SEGMENT << " bytes]\n";
+	std::cout << "[Pointer overhead: " << POINTER_SEGMENT << " bytes]\n";
+	std::cout << "[Total allocated: " << MEMORY_SIZE << " bytes]\n";
 }
